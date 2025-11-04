@@ -28,6 +28,55 @@ Le projet contient **6 tables Excel** dans `data/` :
 - FAQ_Resiliation_et_Modifications.pdf
 - FAQ_Catalogue_Telephones.pdf
 
+## 🔧 Installation et Configuration
+
+### 1. Cloner le Projet
+
+Commencez par cloner le projet sur votre ordinateur :
+
+```bash
+git clone https://github.com/BastinFlorian/dauphine-project-iasd-2025
+cd dauphine-project-iasd-2025
+```
+
+### 2. Créer une Branche de Développement
+
+**Important** : Ne travaillez pas directement sur la branche `main`. Créez votre propre branche :
+
+```bash
+# Créer et basculer sur une nouvelle branche
+git checkout -b FEATURE/description-de-votre-travail
+
+# Exemple :
+git checkout -b FEATURE/multi-agent-rag-system
+```
+
+### 3. Workflow Git
+
+Pendant votre développement, utilisez ce workflow :
+
+```bash
+# Voir l'état de vos modifications
+git status
+
+# Ajouter vos fichiers modifiés
+git add .
+# Ou ajouter des fichiers spécifiques
+git add src/main.py evaluate.py
+
+# Créer un commit avec un message descriptif
+git commit -m "feat: implement RAG agent with PDF indexing"
+
+# Pousser votre branche sur GitHub
+git push origin FEATURE/description-de-votre-travail
+```
+
+**Bonnes pratiques Git** :
+- Faites des commits réguliers avec des messages clairs
+- Utilisez des messages conventionnels (feat, fix, docs, refactor, etc.)
+- Poussez régulièrement votre code pour éviter de perdre votre travail
+- Créer des Pull Request et merger le code sur main ensuite, uniquement après validation de votre binôme
+
 ## 🚀 Lancer l'Application
 
 Pour vous simplifier la démonstration, une interface a été crée.
@@ -52,6 +101,12 @@ R. Nous acceptons les paiements par carte bancaire, prélèvement automatique, v
 **Q. Y a-t-il des frais de résiliation si je suis engagé ?**
 
 R. Si vous êtes encore en période d'engagement, des frais égaux au montant des mensualités restantes peuvent s'appliquer. Si vous êtes hors engagement (après 12 ou 24 mois), la résiliation est gratuite.
+
+Pour evaluer votre agent, il faudra modifier le script d'évaluation (créé par défaut):
+
+```python
+python evaluate.py
+```
 
 ## 🎯 Travail à Réaliser
 
