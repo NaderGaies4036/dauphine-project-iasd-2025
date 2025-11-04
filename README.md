@@ -4,7 +4,7 @@ Projet de Support Client (Multi)-Agent pour Entreprise Téléphonique
 
 ## 📋 Description du Projet
 
-Système Agentique pour un service client téléphonique fictif **TelecomPlus**. Le système doit répondre aux questions clients en utilisant des documents PDF (FAQ) et des données SQL (base de données clients).
+Système Agentique pour un service client téléphonique fictif **TelecomPlus**. Le système doit répondre aux questions clients en utilisant des documents PDF (FAQ) et des données SQL/XLSX (base de données clients).
 
 ## 📊 Tables de Données
 
@@ -30,7 +30,9 @@ Le projet contient **6 tables Excel** dans `data/` :
 
 ## 🚀 Lancer l'Application
 
-Pour vous simplifier la démonstration, une interface a été crée. Pour la lancer sur votre ordinateur, après avoir créer un evnironnemnt virtuel, éxécutez les commandes suivantes:
+Pour vous simplifier la démonstration, une interface a été crée.
+
+Pour la lancer sur votre ordinateur, après avoir créé un environnement virtuel, éxécutez les commandes suivantes:
 
 ```bash
 pip install -r requirements.txt
