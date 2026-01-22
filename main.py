@@ -1,22 +1,3 @@
-# src/main.py
-"""
-TelecomPlusAgent - Version optimisée pour évaluation avec OpenRouter (Mixtral / Claude).
-
-Fonctionnalités :
-- Charge les PDFs (FAQ) depuis data/pdfs et les Excels depuis data/xlsx
-- Indexe les PDFs avec Chroma si disponible, sinon garde le texte en mémoire
-- Fournit des outils "SQL-like" sur les fichiers Excel via pandas
-- Orchestration entre RAG (FAQ) et données clients (Excel)
-- Extraction d'email / téléphone (et extensible au nom) depuis la question
-- Appelle OpenRouter (modèle configurable) comme générateur final
-- Expose `answer(question)` compatible avec evaluate.py
-
-Dépendances :
-pip install python-dotenv requests pandas PyPDF2
-Optionnel (pour Chroma/embeddings) :
-pip install chromadb langchain langchain-community langchain-text-splitters tf-keras
-"""
-
 import os
 import json
 import logging
@@ -27,14 +8,29 @@ from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 import requests
 
-# --------------------------------------------------------------------------- #
-# Configuration globale
-# --------------------------------------------------------------------------- #
+# Import Langfuse
+try:
+    from langfuse import Langfuse
+    from langfuse.decorators import observe, langfuse_context
+    LANGFUSE_AVAILABLE = True
+except ImportError:
+    LANGFUSE_AVAILABLE = False
+    logger.warning("Langfuse non disponible. Installez-le avec: pip install langfuse")
 
+# Configuration
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-# Tu peux changer le modèle ici ou via TELECOMPLUS_LLM_MODEL dans ton .env
 LLM_MODEL = os.getenv("TELECOMPLUS_LLM_MODEL", "anthropic/claude-3.7-sonnet")
+
+# Initialiser Langfuse si disponible
+if LANGFUSE_AVAILABLE:
+    langfuse = Langfuse(
+        public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+        secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+        host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+    )
+else:
+    langfuse = None
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -44,13 +40,10 @@ XLSX_DIR = os.path.join(DATA_DIR, "xlsx")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("TelecomPlusAgent")
 
-# Regex simples pour email et téléphone
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"\+?\d[\d\s().-]{6,}")
 
-# --------------------------------------------------------------------------- #
-# Dépendances optionnelles (RAG / vecteurs / LLM)
-# --------------------------------------------------------------------------- #
+# Imports optionnels
 try:
     from langchain_community.document_loaders import PyPDFLoader
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -70,10 +63,6 @@ except Exception:
     pd = None
 
 
-# --------------------------------------------------------------------------- #
-# Structures de données
-# --------------------------------------------------------------------------- #
-
 @dataclass
 class RetrievalResult:
     question: str
@@ -82,34 +71,19 @@ class RetrievalResult:
 
 
 class TelecomPlusAgent:
-    """
-    Agent principal :
-    - RAG sur les FAQ PDF
-    - Outils tabulaires (Excel) pour les données clients
-    - Génération finale via OpenRouter
-    """
-
     def __init__(self):
-        # PDF / RAG
         self.vectorstore = None
         self.pdf_chunks: List[str] = []
-
-        # Données tabulaires
         self.dataframes: Dict[str, "pd.DataFrame"] = {}
-
-        # Initialisation des données
         self._init_data()
 
-    # ------------------------------------------------------------------ #
-    # Initialisation des données
-    # ------------------------------------------------------------------ #
     def _init_data(self) -> None:
         self._load_excels()
         self._build_or_load_pdf_index()
 
     def _load_excels(self) -> None:
         if pd is None:
-            logger.warning("pandas non disponible : les outils tabulaires sont désactivés.")
+            logger.warning("pandas non disponible")
             return
 
         filenames = [
@@ -128,8 +102,6 @@ class TelecomPlusAgent:
                     logger.info("Chargé: %s", path)
                 except Exception as e:
                     logger.error("Erreur de chargement %s: %s", path, e)
-            else:
-                logger.warning("Fichier Excel introuvable: %s", path)
 
     def _build_or_load_pdf_index(self) -> None:
         pdf_files = [
@@ -141,7 +113,6 @@ class TelecomPlusAgent:
             logger.warning("Aucun PDF trouvé dans %s", PDF_DIR)
             return
 
-        # Si Chroma + embeddings disponibles, on construit un index
         if PyPDFLoader and RecursiveCharacterTextSplitter and Chroma and HuggingFaceEmbeddings:
             logger.info("Construction de l'index Chroma pour les FAQ...")
             docs = []
@@ -163,22 +134,24 @@ class TelecomPlusAgent:
             )
             logger.info("Index Chroma construit (%d chunks).", len(split_docs))
         else:
-            # Fallback : garder seulement le texte en mémoire
             logger.warning("Chroma/Embeddings indisponibles, fallback en mémoire.")
             texts = []
-            if not PyPDFLoader:
-                logger.warning("PyPDFLoader indisponible, impossible de charger les PDF.")
-            else:
+            if PyPDFLoader:
                 for pdf in pdf_files:
                     loader = PyPDFLoader(os.path.join(PDF_DIR, pdf))
                     docs = loader.load()
                     texts.extend([d.page_content for d in docs])
             self.pdf_chunks = texts
 
-    # ------------------------------------------------------------------ #
-    # RAG PDF
-    # ------------------------------------------------------------------ #
+    @observe(name="retrieve_from_pdfs")
     def retrieve_from_pdfs(self, question: str, k: int = 6) -> RetrievalResult:
+        """RAG avec monitoring Langfuse"""
+        if LANGFUSE_AVAILABLE:
+            langfuse_context.update_current_observation(
+                input=question,
+                metadata={"k": k, "has_vectorstore": self.vectorstore is not None}
+            )
+        
         if self.vectorstore:
             docs = self.vectorstore.similarity_search(question, k=k)
             chunks = [d.page_content for d in docs]
@@ -186,19 +159,28 @@ class TelecomPlusAgent:
             chunks = self.pdf_chunks[:k] if self.pdf_chunks else []
 
         context = "\n\n---\n\n".join(chunks)
-        return RetrievalResult(
+        result = RetrievalResult(
             question=question,
             context=context,
             source_chunks=chunks,
         )
+        
+        if LANGFUSE_AVAILABLE:
+            langfuse_context.update_current_observation(
+                output={"num_chunks": len(chunks), "context_length": len(context)}
+            )
+        
+        return result
 
-    # ------------------------------------------------------------------ #
-    # Outils "SQL-like" sur les Excels (simplifiés)
-    # ------------------------------------------------------------------ #
+    @observe(name="get_client_data")
     def get_client_by_email_or_phone(self, identifier: str) -> Optional[Dict[str, Any]]:
-        if not identifier:
-            return None
-        if pd is None or "clients" not in self.dataframes:
+        """Récupération données client avec monitoring"""
+        if LANGFUSE_AVAILABLE:
+            langfuse_context.update_current_observation(
+                input={"identifier_provided": bool(identifier)}
+            )
+        
+        if not identifier or pd is None or "clients" not in self.dataframes:
             return None
 
         df = self.dataframes["clients"]
@@ -207,13 +189,25 @@ class TelecomPlusAgent:
             | df["telephone"].astype(str).str.contains(identifier, case=False, na=False)
         )
         rows = df[mask]
+        
         if rows.empty:
+            if LANGFUSE_AVAILABLE:
+                langfuse_context.update_current_observation(
+                    output={"client_found": False}
+                )
             return None
-        return rows.iloc[0].to_dict()
+        
+        result = rows.iloc[0].to_dict()
+        if LANGFUSE_AVAILABLE:
+            langfuse_context.update_current_observation(
+                output={"client_found": True, "client_id": result.get("id")}
+            )
+        
+        return result
 
     def get_client_invoices_summary(self, client_id: Any) -> str:
         if pd is None or "factures" not in self.dataframes:
-            return "Les informations de facturation ne sont pas disponibles pour le moment."
+            return "Les informations de facturation ne sont pas disponibles."
 
         df = self.dataframes["factures"]
         rows = df[df["client_id"] == client_id]
@@ -226,52 +220,48 @@ class TelecomPlusAgent:
             f"échéance le {latest.get('date_echeance')}."
         )
 
-    # ------------------------------------------------------------------ #
-    # Routing / classification de la question
-    # ------------------------------------------------------------------ #
     def _needs_client_data(self, question: str) -> bool:
         q = question.lower()
         keywords = [
-            "ma facture",
-            "mes factures",
-            "mon forfait",
-            "mon abonnement",
-            "mes consommations",
-            "mon engagement",
-            "mon contrat",
-            "mon compte",
+            "ma facture", "mes factures", "mon forfait", "mon abonnement",
+            "mes consommations", "mon engagement", "mon contrat", "mon compte",
         ]
         return any(k in q for k in keywords)
 
+    @observe(name="classify_query")
     def _classify_query(self, question: str) -> str:
+        """Classification avec monitoring"""
         q = question.lower()
 
         if self._needs_client_data(question):
-            return "client"
+            query_type = "client"
+        else:
+            billing_keywords = ["facture", "paiement", "échéance", "prélèvement"]
+            tech_keywords = ["réseau", "4g", "5g", "internet", "débit", "panne", "coupure"]
+            offer_keywords = ["forfait", "offre", "option", "tarif", "engagement", "roaming"]
 
-        billing_keywords = ["facture", "paiement", "échéance", "prélèvement"]
-        tech_keywords = ["réseau", "4g", "5g", "internet", "débit", "panne", "coupure"]
-        offer_keywords = ["forfait", "offre", "option", "tarif", "engagement", "roaming", "international"]
+            if any(k in q for k in billing_keywords):
+                query_type = "billing"
+            elif any(k in q for k in tech_keywords):
+                query_type = "technical"
+            elif any(k in q for k in offer_keywords):
+                query_type = "offer"
+            else:
+                query_type = "generic"
+        
+        if LANGFUSE_AVAILABLE:
+            langfuse_context.update_current_observation(
+                input=question,
+                output={"query_type": query_type}
+            )
+        
+        return query_type
 
-        if any(k in q for k in billing_keywords):
-            return "billing"
-        if any(k in q for k in tech_keywords):
-            return "technical"
-        if any(k in q for k in offer_keywords):
-            return "offer"
-
-        return "generic"
-
-    # ------------------------------------------------------------------ #
-    # Extraction d'identifiant client (email / téléphone)
-    # ------------------------------------------------------------------ #
     def _extract_identifier(self, question: str) -> str:
-        # Email en priorité
         email_match = EMAIL_REGEX.search(question)
         if email_match:
             return email_match.group(0)
 
-        # Téléphone simple
         phone_match = PHONE_REGEX.search(question)
         if phone_match:
             phone = re.sub(r"[^\d+]", "", phone_match.group(0))
@@ -279,13 +269,19 @@ class TelecomPlusAgent:
 
         return ""
 
-    # ------------------------------------------------------------------ #
-    # Appel OpenRouter
-    # ------------------------------------------------------------------ #
+    @observe(name="call_llm")
     def _call_openrouter(self, system_prompt: str, user_prompt: str) -> str:
+        """Appel LLM avec monitoring complet"""
+        if LANGFUSE_AVAILABLE:
+            langfuse_context.update_current_observation(
+                model=LLM_MODEL,
+                input={"system": system_prompt, "user": user_prompt},
+                metadata={"provider": "openrouter"}
+            )
+        
         if not OPENROUTER_API_KEY:
-            logger.warning("OPENROUTER_API_KEY manquant, réponse de fallback.")
-            return "Le service IA externe n'est pas configuré. Merci de réessayer plus tard."
+            logger.warning("OPENROUTER_API_KEY manquant")
+            return "Le service IA externe n'est pas configuré."
 
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
@@ -305,25 +301,47 @@ class TelecomPlusAgent:
             resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            answer = data["choices"][0]["message"]["content"]
+            
+            if LANGFUSE_AVAILABLE:
+                usage = data.get("usage", {})
+                langfuse_context.update_current_observation(
+                    output=answer,
+                    usage={
+                        "input": usage.get("prompt_tokens", 0),
+                        "output": usage.get("completion_tokens", 0),
+                        "total": usage.get("total_tokens", 0)
+                    }
+                )
+            
+            return answer
         except Exception as e:
             logger.error("Erreur appel OpenRouter: %s", e)
-            return "Une erreur technique s'est produite lors de la génération de la réponse."
+            if LANGFUSE_AVAILABLE:
+                langfuse_context.update_current_observation(
+                    level="ERROR",
+                    status_message=str(e)
+                )
+            return "Une erreur technique s'est produite."
 
-    # ------------------------------------------------------------------ #
-    # Orchestration principale
-    # ------------------------------------------------------------------ #
+    @observe(name="answer_customer_query")
     def answer(self, question: str) -> str:
-        """
-        Point d'entrée principal, utilisé par evaluate.py et app.py.
-        """
+        """Point d'entrée principal avec monitoring complet"""
+        if LANGFUSE_AVAILABLE:
+            langfuse_context.update_current_trace(
+                name="telecomplus_query",
+                user_id="evaluation_script",
+                metadata={"question_length": len(question)}
+            )
+            langfuse_context.update_current_observation(
+                input=question
+            )
+        
         query_type = self._classify_query(question)
         needs_data = (query_type == "client")
 
-        # 1) RAG PDF
         retrieval = self.retrieve_from_pdfs(question, k=6)
 
-        # 2) Données client (si pertinent)
         data_context = ""
         if needs_data:
             identifier = self._extract_identifier(question)
@@ -340,26 +358,17 @@ class TelecomPlusAgent:
                 )
             else:
                 data_context = (
-                    "Aucune information client spécifique n'a pu être trouvée "
-                    "(identifiant client non présent ou non reconnu dans la question)."
+                    "Aucune information client spécifique n'a pu être trouvée."
                 )
 
-        # 3) Prompt système
         system_prompt = (
-            "Tu es un agent de support client expert pour un opérateur téléphonique fictif nommé TelecomPlus. "
+            "Tu es un agent de support client expert pour TelecomPlus. "
             "Tu réponds en français, avec un ton professionnel, empathique et rassurant. "
-            "Tu aides les clients sur des sujets comme : factures, forfaits, options, consommation, "
-            "problèmes de réseau, roaming et support technique. "
-            "Base-toi uniquement sur le contexte fourni (FAQ PDF et données tabulaires Excel). "
-            "Ne fais pas de suppositions sur des données clients si elles ne sont pas explicitement présentes. "
-            "Quand une information manque, indique-le clairement et propose des étapes concrètes "
-            '(par exemple : \"connectez-vous à votre espace client\" ou \"contactez le service client au numéro indiqué sur votre facture\"). '
-            "Tes réponses doivent être factuelles, structurées et centrées sur la résolution du problème du client."
+            "Base-toi uniquement sur le contexte fourni (FAQ PDF et données tabulaires). "
+            "Tes réponses doivent être factuelles, structurées et centrées sur la résolution."
         )
 
-        # 4) Prompt utilisateur structuré
         user_prompt_parts = [
-            "Tu vas répondre à un client de TelecomPlus.",
             f"Question du client :\n{question}",
             f"Type de question détecté : {query_type}",
             "\n===== CONTEXTE FAQ (PDF) =====\n",
@@ -367,34 +376,34 @@ class TelecomPlusAgent:
         ]
 
         if data_context:
-            user_prompt_parts.append("\n===== CONTEXTE DONNÉES CLIENT (Excel) =====\n")
+            user_prompt_parts.append("\n===== CONTEXTE DONNÉES CLIENT =====\n")
             user_prompt_parts.append(data_context)
 
         user_prompt_parts.append(
-            "\n===== CONSIGNES DE RÉPONSE =====\n"
-            "- Commence par une phrase courte qui répond directement à la question du client.\n"
-            "- Ensuite, détaille les informations importantes (montants, dates, conditions, démarches) en quelques phrases ou points.\n"
-            "- Si des informations clients sont disponibles, personnalise la réponse (par exemple : montant, échéance, statut de facture).\n"
-            "- Si des informations sont manquantes, explique-le poliment et propose des démarches concrètes.\n"
-            "- Si la question concerne un forfait ou une offre, explique clairement les conditions importantes (prix, durée d'engagement, options, limitations) présentes dans le contexte.\n"
-            "- Ne mentionne pas ce contexte interne, ni les noms de fichiers, ni les mots 'FAQ', 'Excel' ou 'PDF'.\n"
-            "- Ne génère pas d'informations qui ne figurent pas dans le contexte.\n"
-            "- Formule une seule réponse finale en français, adaptée au client."
+            "\n===== CONSIGNES =====\n"
+            "- Réponds directement et clairement\n"
+            "- Personnalise si données client disponibles\n"
+            "- Explique les conditions importantes\n"
+            "- Propose des démarches concrètes si info manquante"
         )
 
         user_prompt = "\n".join(user_prompt_parts)
-
-        # 5) Appel au modèle
         answer = self._call_openrouter(system_prompt, user_prompt)
+        
+        if LANGFUSE_AVAILABLE:
+            langfuse_context.update_current_observation(
+                output=answer,
+                metadata={
+                    "query_type": query_type,
+                    "rag_chunks_used": len(retrieval.source_chunks),
+                    "client_data_used": bool(data_context)
+                }
+            )
+        
         return answer.strip()
 
 
-# --------------------------------------------------------------------------- #
-# Instance globale + wrapper pour evaluate.py
-# --------------------------------------------------------------------------- #
-
 _agent: Optional[TelecomPlusAgent] = None
-
 
 def get_agent() -> TelecomPlusAgent:
     global _agent
@@ -402,11 +411,5 @@ def get_agent() -> TelecomPlusAgent:
         _agent = TelecomPlusAgent()
     return _agent
 
-
 def answer(question: str) -> str:
-    """
-    Wrapper simple à utiliser dans evaluate.py :
-    from src.main import answer
-    resp = answer("Ma question")
-    """
     return get_agent().answer(question)
