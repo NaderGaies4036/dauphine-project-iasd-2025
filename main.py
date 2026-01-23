@@ -10,6 +10,7 @@ import requests
 
 # Import Langfuse
 try:
+    
     from langfuse import Langfuse
     from langfuse.decorators import observe, langfuse_context
     LANGFUSE_AVAILABLE = True
