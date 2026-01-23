@@ -2,7 +2,7 @@
 
 import streamlit as st
 
-from src.main import answer
+from main import answer
 
 st.set_page_config(page_title="TelecomPlus Support", page_icon="📱")
 
