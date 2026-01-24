@@ -204,9 +204,8 @@ def main() -> None:
 
     # 3) Sauvegarde des résultats
     results_df = pd.DataFrame(results)
-    print(results_df.head())
     avg_score = results_df["score"].mean() if not results_df.empty else 0.0
-    logger.info("Score moyen sur le jeu d'évaluation: %.3f", avg_score)
+    print("Score moyen sur le jeu d'évaluation:", avg_score)
 
     results_df.to_excel(OUTPUT_PATH, index=False)
     logger.info("Résultats sauvegardés dans: %s", OUTPUT_PATH)

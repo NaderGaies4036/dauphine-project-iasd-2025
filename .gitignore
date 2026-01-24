@@ -23,6 +23,8 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+debug.py
+
 
 # Translations
 *.mo
