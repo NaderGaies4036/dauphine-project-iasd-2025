@@ -1,3 +1,4 @@
+
 import os
 import json
 import logging
@@ -8,58 +9,44 @@ from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 import requests
 
-# 1. Configuration initiale du Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("TelecomPlusAgent")
-
-# 2. Import Langfuse avec gestion d'erreur ET fallback
+# Import LangSmith
 try:
+    from langsmith import traceable, Client
+    from langsmith.run_helpers import get_current_run_tree
+    LANGSMITH_AVAILABLE = True
     
-    from langfuse import Langfuse
-    from langfuse.decorators import observe, langfuse_context
-    LANGFUSE_AVAILABLE = True
+    # Initialiser le client LangSmith
+    langsmith_client = Client(
+        api_key=os.getenv("LANGSMITH_API_KEY"),
+        api_url=os.getenv("LANGSMITH_API_URL", "https://api.smith.langchain.com")
+    )
 except ImportError:
-    LANGFUSE_AVAILABLE = False
-    logger.warning("Langfuse non disponible. Utilisation d'un décorateur vide.")
-    
-    # --- SOLUTION : On crée un décorateur vide pour éviter la NameError ---
-    def observe(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
-    
-    langfuse_context = None
+    LANGSMITH_AVAILABLE = False
+    logging.warning("LangSmith non disponible. Installez-le avec: pip install langsmith")
+    langsmith_client = None
 
-# 3. Configuration de l'environnement
+# Configuration
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-LLM_MODEL = os.getenv("TELECOMPLUS_LLM_MODEL", "anthropic/claude-3.7-sonnet")
+LLM_MODEL = os.getenv("TELECOMPLUS_LLM_MODEL", "openai/gpt-oss-120b")
 
-# Initialiser Langfuse si disponible
-if LANGFUSE_AVAILABLE:
-    langfuse = Langfuse(
-        public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-        secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-        host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
-    )
-else:
-    langfuse = None
-
-# Chemins des dossiers
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 PDF_DIR = os.path.join(DATA_DIR, "pdfs")
 XLSX_DIR = os.path.join(DATA_DIR, "xlsx")
 
-# Regex pour l'extraction
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TelecomPlusAgent")
+
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"\+?\d[\d\s().-]{6,}")
 
-# Imports optionnels (LangChain / Pandas)
+# Imports optionnels
 try:
     from langchain_community.document_loaders import PyPDFLoader
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     from langchain_community.vectorstores import Chroma
+    import chromadb
     from langchain_community.embeddings import HuggingFaceEmbeddings
     logger.info("Imports LangChain / Chroma OK.")
 except Exception as e:
@@ -74,11 +61,13 @@ try:
 except Exception:
     pd = None
 
+
 @dataclass
 class RetrievalResult:
     question: str
     context: str
     source_chunks: List[str]
+
 
 class TelecomPlusAgent:
     def __init__(self):
@@ -114,11 +103,10 @@ class TelecomPlusAgent:
                     logger.error("Erreur de chargement %s: %s", path, e)
 
     def _build_or_load_pdf_index(self) -> None:
-        if not os.path.isdir(PDF_DIR):
-            logger.warning("Dossier PDF inexistant: %s", PDF_DIR)
-            return
-
-        pdf_files = [f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]
+        pdf_files = [
+            f for f in os.listdir(PDF_DIR)
+            if f.lower().endswith(".pdf")
+        ] if os.path.isdir(PDF_DIR) else []
 
         if not pdf_files:
             logger.warning("Aucun PDF trouvé dans %s", PDF_DIR)
@@ -131,7 +119,10 @@ class TelecomPlusAgent:
                 loader = PyPDFLoader(os.path.join(PDF_DIR, pdf))
                 docs.extend(loader.load())
 
-            splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=150)
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=700,
+                chunk_overlap=150,
+            )
             split_docs = splitter.split_documents(docs)
 
             embeddings = HuggingFaceEmbeddings()
@@ -151,14 +142,9 @@ class TelecomPlusAgent:
                     texts.extend([d.page_content for d in docs])
             self.pdf_chunks = texts
 
-    @observe(name="retrieve_from_pdfs")
+    @traceable(name="retrieve_from_pdfs", run_type="retriever")
     def retrieve_from_pdfs(self, question: str, k: int = 6) -> RetrievalResult:
-        if LANGFUSE_AVAILABLE:
-            langfuse_context.update_current_observation(
-                input=question,
-                metadata={"k": k, "has_vectorstore": self.vectorstore is not None}
-            )
-        
+        """RAG avec monitoring LangSmith"""
         if self.vectorstore:
             docs = self.vectorstore.similarity_search(question, k=k)
             chunks = [d.page_content for d in docs]
@@ -166,16 +152,17 @@ class TelecomPlusAgent:
             chunks = self.pdf_chunks[:k] if self.pdf_chunks else []
 
         context = "\n\n---\n\n".join(chunks)
-        result = RetrievalResult(question=question, context=context, source_chunks=chunks)
+        result = RetrievalResult(
+            question=question,
+            context=context,
+            source_chunks=chunks,
+        )
         
-        if LANGFUSE_AVAILABLE:
-            langfuse_context.update_current_observation(
-                output={"num_chunks": len(chunks), "context_length": len(context)}
-            )
         return result
 
-    @observe(name="get_client_data")
+    @traceable(name="get_client_data", run_type="tool")
     def get_client_by_email_or_phone(self, identifier: str) -> Optional[Dict[str, Any]]:
+        """Récupération données client avec monitoring"""
         if not identifier or pd is None or "clients" not in self.dataframes:
             return None
 
@@ -189,7 +176,8 @@ class TelecomPlusAgent:
         if rows.empty:
             return None
         
-        return rows.iloc[0].to_dict()
+        result = rows.iloc[0].to_dict()
+        return result
 
     def get_client_invoices_summary(self, client_id: Any) -> str:
         if pd is None or "factures" not in self.dataframes:
@@ -208,13 +196,17 @@ class TelecomPlusAgent:
 
     def _needs_client_data(self, question: str) -> bool:
         q = question.lower()
-        keywords = ["ma facture", "mes factures", "mon forfait", "mon abonnement",
-                    "mes consommations", "mon engagement", "mon contrat", "mon compte"]
+        keywords = [
+            "ma facture", "mes factures", "mon forfait", "mon abonnement",
+            "mes consommations", "mon engagement", "mon contrat", "mon compte",
+        ]
         return any(k in q for k in keywords)
 
-    @observe(name="classify_query")
+    @traceable(name="classify_query", run_type="tool")
     def _classify_query(self, question: str) -> str:
+        """Classification avec monitoring"""
         q = question.lower()
+
         if self._needs_client_data(question):
             query_type = "client"
         else:
@@ -222,24 +214,32 @@ class TelecomPlusAgent:
             tech_keywords = ["réseau", "4g", "5g", "internet", "débit", "panne", "coupure"]
             offer_keywords = ["forfait", "offre", "option", "tarif", "engagement", "roaming"]
 
-            if any(k in q for k in billing_keywords): query_type = "billing"
-            elif any(k in q for k in tech_keywords): query_type = "technical"
-            elif any(k in q for k in offer_keywords): query_type = "offer"
-            else: query_type = "generic"
+            if any(k in q for k in billing_keywords):
+                query_type = "billing"
+            elif any(k in q for k in tech_keywords):
+                query_type = "technical"
+            elif any(k in q for k in offer_keywords):
+                query_type = "offer"
+            else:
+                query_type = "generic"
         
         return query_type
 
     def _extract_identifier(self, question: str) -> str:
         email_match = EMAIL_REGEX.search(question)
-        if email_match: return email_match.group(0)
+        if email_match:
+            return email_match.group(0)
 
         phone_match = PHONE_REGEX.search(question)
         if phone_match:
-            return re.sub(r"[^\d+]", "", phone_match.group(0))
+            phone = re.sub(r"[^\d+]", "", phone_match.group(0))
+            return phone
+
         return ""
 
-    @observe(name="call_llm")
+    @traceable(name="call_llm", run_type="llm")
     def _call_openrouter(self, system_prompt: str, user_prompt: str) -> str:
+        """Appel LLM avec monitoring complet"""
         if not OPENROUTER_API_KEY:
             logger.warning("OPENROUTER_API_KEY manquant")
             return "Le service IA externe n'est pas configuré."
@@ -262,61 +262,117 @@ class TelecomPlusAgent:
             resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
             resp.raise_for_status()
             data = resp.json()
-            answer_text = data["choices"][0]["message"]["content"]
+            answer = data["choices"][0]["message"]["content"]
             
-            if LANGFUSE_AVAILABLE:
-                usage = data.get("usage", {})
-                langfuse_context.update_current_observation(
-                    usage={
-                        "input": usage.get("prompt_tokens", 0),
-                        "output": usage.get("completion_tokens", 0),
-                        "total": usage.get("total_tokens", 0)
-                    }
-                )
-            return answer_text
+            # Ajouter les métadonnées pour LangSmith
+            if LANGSMITH_AVAILABLE:
+                try:
+                    run_tree = get_current_run_tree()
+                    if run_tree:
+                        usage = data.get("usage", {})
+                        run_tree.extra = {
+                            "model": LLM_MODEL,
+                            "input_tokens": usage.get("prompt_tokens", 0),
+                            "output_tokens": usage.get("completion_tokens", 0),
+                            "total_tokens": usage.get("total_tokens", 0),
+                        }
+                except Exception as e:
+                    logger.debug(f"Impossible d'ajouter les métadonnées LangSmith: {e}")
+            
+            return answer
         except Exception as e:
             logger.error("Erreur appel OpenRouter: %s", e)
             return "Une erreur technique s'est produite."
 
-    @observe(name="answer_customer_query")
+    @traceable(
+        name="answer_customer_query",
+        run_type="chain",
+        project_name="telecomplus-agent"
+    )
     def answer(self, question: str) -> str:
-        if LANGFUSE_AVAILABLE:
-            langfuse_context.update_current_trace(
-                name="telecomplus_query",
-                user_id="evaluation_script",
-                metadata={"question_length": len(question)}
-            )
-
+        """Point d'entrée principal avec monitoring complet"""
         query_type = self._classify_query(question)
+        needs_data = (query_type == "client")
+
+        # RAG
         retrieval = self.retrieve_from_pdfs(question, k=6)
 
+        # Données client
         data_context = ""
-        if query_type == "client":
+        if needs_data:
             identifier = self._extract_identifier(question)
             client = self.get_client_by_email_or_phone(identifier) if identifier else None
-            if client:
-                factures_summary = self.get_client_invoices_summary(client.get("id"))
-                data_context = f"Infos client:\n{json.dumps(client, ensure_ascii=False)}\n\nFactures:\n{factures_summary}"
-            else:
-                data_context = "Aucune information client trouvée. Demandez l'email ou le téléphone."
 
+            if client:
+                client_id = client.get("id")
+                factures_summary = self.get_client_invoices_summary(client_id)
+                data_context = (
+                    "Informations client:\n"
+                    + json.dumps(client, default=str, ensure_ascii=False)
+                    + "\n\nRésumé factures:\n"
+                    + factures_summary
+                )
+            else:
+                data_context = (
+                    "Aucune information client spécifique n'a pu être trouvée."
+                )
+
+        # Prompts
         system_prompt = (
-            "Tu es un agent de support expert pour TelecomPlus. Réponds en français, "
-            "ton pro, empathique. Base-toi sur le contexte fourni."
+            "Tu es un agent de support client expert pour TelecomPlus. "
+            "Tu réponds en français, avec un ton professionnel, empathique et rassurant. "
+            "Base-toi uniquement sur le contexte fourni (FAQ PDF et données tabulaires). "
+            "Tes réponses doivent être factuelles, structurées et centrées sur la résolution."
         )
 
-        user_prompt = f"Question: {question}\nType: {query_type}\n\nFAQ:\n{retrieval.context}\n\nDonnées:\n{data_context}"
+        user_prompt_parts = [
+            f"Question du client :\n{question}",
+            f"Type de question détecté : {query_type}",
+            "\n===== CONTEXTE FAQ (PDF) =====\n",
+            retrieval.context or "(aucun contexte FAQ disponible).",
+        ]
+
+        if data_context:
+            user_prompt_parts.append("\n===== CONTEXTE DONNÉES CLIENT =====\n")
+            user_prompt_parts.append(data_context)
+
+        user_prompt_parts.append(
+            "\n===== CONSIGNES =====\n"
+            "- Réponds directement et clairement\n"
+            "- Personnalise si données client disponibles\n"
+            "- Explique les conditions importantes\n"
+            "- Propose des démarches concrètes si info manquante"
+        )
+
+        user_prompt = "\n".join(user_prompt_parts)
+        answer = self._call_openrouter(system_prompt, user_prompt)
         
-        return self._call_openrouter(system_prompt, user_prompt).strip()
+        # Ajouter métadonnées pour LangSmith
+        if LANGSMITH_AVAILABLE:
+            try:
+                run_tree = get_current_run_tree()
+                if run_tree:
+                    run_tree.extra = {
+                        "query_type": query_type,
+                        "rag_chunks_used": len(retrieval.source_chunks),
+                        "client_data_used": bool(data_context),
+                        "question_length": len(question),
+                    }
+            except Exception as e:
+                logger.debug(f"Impossible d'ajouter les métadonnées: {e}")
+        
+        return answer.strip()
 
-# Singleton pour l'agent
-_agent = None
 
-def get_agent():
+_agent: Optional[TelecomPlusAgent] = None
+
+
+def get_agent() -> TelecomPlusAgent:
     global _agent
     if _agent is None:
         _agent = TelecomPlusAgent()
     return _agent
+
 
 def answer(question: str) -> str:
     return get_agent().answer(question)

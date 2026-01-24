@@ -4,20 +4,6 @@ Agent intelligent de support client pour opérateur télécom utilisant RAG (Ret
 
 ---
 
-## 📋 Table des matières
-
-- [Fonctionnalités](#-fonctionnalités)
-- [Architecture](#-architecture)
-- [Installation](#-installation)
-- [Configuration](#-configuration)
-- [Utilisation](#-utilisation)
-- [Évaluation](#-évaluation)
-- [Monitoring](#-monitoring)
-- [Structure du projet](#-structure-du-projet)
-- [Technologies](#-technologies)
-
----
-
 ## 🎯 Fonctionnalités
 
 ### ✅ Agent IA Multi-sources
@@ -42,7 +28,7 @@ Agent intelligent de support client pour opérateur télécom utilisant RAG (Ret
 ### 📊 Évaluation automatique
 
 - Script d'évaluation sur 25 questions de test
-- LLM-as-a-judge (Claude 3.7 Sonnet via OpenRouter)
+- LLM-as-a-judge 
 - Scoring de 0 à 1 avec justifications
 - Export des résultats dans Excel
 
@@ -136,5 +122,108 @@ telecomplus_query
 
 ### Interface utilisateur
 - **Streamlit** : Framework pour applications web Python
+
+---
+
+## 💻 Utilisation
+
+### Option 1 : Interface Streamlit
+
+
+```bash
+streamlit run app.py
+```
+
+L'application s'ouvre automatiquement dans votre navigateur à l'adresse : `http://localhost:8501`
+
+**Fonctionnalités :**
+- Chat en temps réel
+- Historique de conversation
+- Réponses contextualisées
+- Support FAQ + données client
+
+**Exemples de questions :**
+
+```
+💬 Questions générales (FAQ) :
+- "Quels sont vos forfaits disponibles ?"
+- "Comment activer le roaming international ?"
+- "Que faire en cas de panne réseau ?"
+
+💬 Questions personnalisées (avec email/téléphone) :
+- "Quel est le montant de ma facture ? (client@example.com)"
+- "Ma consommation ce mois-ci ? (+33612345678)"
+- "Quand expire mon engagement ? (client@example.com)"
+```
+
+---
+
+## 📁 Structure du projet
+
+```
+dauphine-project-iasd-2025/
+│
+├── 📂 data/                        # Données du projet
+│   ├── 📂 pdfs/                    # Documents FAQ (PDF)
+│   │   └── faq_telecomplus.pdf
+│   ├── 📂 xlsx/                    # Données structurées (Excel)
+│   │   ├── clients.xlsx            # Informations clients
+│   │   ├── forfaits.xlsx           # Catalogue forfaits
+│   │   ├── abonnements.xlsx        # Abonnements actifs
+│   │   ├── consommation.xlsx       # Historique consommation
+│   │   ├── factures.xlsx           # Factures et paiements
+│   │   └── tickets_support.xlsx    # Tickets support
+│   └── evaluation_questions.xlsx   # Questions de test (25)
+│
+├── 🤖 main.py                      # Agent principal avec LangSmith
+├── 💬 app.py                       # Interface Streamlit
+├── 📊 evaluate.py                  # Script d'évaluation
+│
+├── 🔧 requirements.txt             # Dépendances Python
+├── 🔑 .env                         # Variables d'environnement (à créer)
+├── 📖 README.md                    # Documentation (ce fichier)
+│
+└── 📄 evaluation_results.xlsx      # Résultats d'évaluation (généré)
+```
+
+---
+
+## 🛠️ Technologies
+
+### Backend & LLM
+
+| Technologie | Utilisation | Version |
+|-------------|-------------|---------|
+| **Python** | Langage principal | 3.9+ |
+| **LangChain** | Framework LLM | 0.1.0 |
+| **OpenRouter** | API LLM unifiée | - |
+| **Claude 3.7 Sonnet** | Modèle de génération | Latest |
+
+### RAG & Embeddings
+
+| Technologie | Utilisation | Version |
+|-------------|-------------|---------|
+| **ChromaDB** | Base vectorielle | 0.4.22 |
+| **Sentence Transformers** | Embeddings | 2.2.2 |
+| **PyPDF2** | Extraction PDF | 3.0.1 |
+
+### Données
+
+| Technologie | Utilisation | Version |
+|-------------|-------------|---------|
+| **Pandas** | Manipulation données | 2.1.4 |
+| **OpenPyXL** | Lecture/écriture Excel | 3.1.2 |
+
+### Monitoring
+
+| Technologie | Utilisation | Version |
+|-------------|-------------|---------|
+| **LangSmith** | Tracing & monitoring | 0.0.87 |
+
+### Interface
+
+| Technologie | Utilisation | Version |
+|-------------|-------------|---------|
+| **Streamlit** | Interface web | 1.29.0 |
 
 ---

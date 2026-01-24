@@ -1,13 +1,14 @@
 # Data for eval
 demo_questions.xlsx
-
+.python-version
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
 __pycache__/
 *__pycache__/
-
+genai/
 *.pyc
+genai_py311/
 # Unit test / coverage reports
 htmlcov/
 .tox/
