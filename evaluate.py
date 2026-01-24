@@ -12,7 +12,7 @@ try:
 except Exception:  # tqdm is optional
     tqdm = None
 
-from src.main import answer as agent_answer
+from main import answer as agent_answer
 
 
 BASE_DIR = os.path.dirname(__file__)
@@ -32,7 +32,7 @@ logger = logging.getLogger("TelecomPlusEvaluation")
 
 def _build_openrouter_payload(system_prompt: str, user_prompt: str) -> Dict[str, Any]:
     return {
-            "model": "anthropic/claude-3.7-sonnet",
+            "model": "meta-llama/llama-3.3-70b-instruct",
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -205,7 +205,7 @@ def main() -> None:
     # 3) Sauvegarde des résultats
     results_df = pd.DataFrame(results)
     avg_score = results_df["score"].mean() if not results_df.empty else 0.0
-    logger.info("Score moyen sur le jeu d'évaluation: %.3f", avg_score)
+    print("Score moyen sur le jeu d'évaluation:", avg_score)
 
     results_df.to_excel(OUTPUT_PATH, index=False)
     logger.info("Résultats sauvegardés dans: %s", OUTPUT_PATH)

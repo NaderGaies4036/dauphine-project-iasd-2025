@@ -1,5 +1,18 @@
-# Web interface
-streamlit>=1.28.0
 
-pandas
-# Langchain, langgraph, ...
+python-dotenv         # Variables d'environnement
+requests            # Appels API HTTP
+pandas             # Manipulation de données tabulaires
+openpyxl              # Lecture/écriture Excel
+PyPDF2                 # Extraction de texte des PDFs
+langchain              # Framework LLM
+langchain-community   # Intégrations communautaires
+langchain-text-splitters  # Découpage de texte
+chromadb              # Base de données vectorielle
+sentence-transformers   # Modèles d'embeddings
+tf-keras              # Backend pour sentence-transformers
+langfuse              # Monitoring et tracing LLM
+langsmith
+streamlit             # Interface web interactive
+
+tqdm                  # Barres de progression
+sentence-transformers

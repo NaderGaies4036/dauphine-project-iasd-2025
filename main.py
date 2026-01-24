@@ -1,42 +1,39 @@
-# src/main.py
-"""
-TelecomPlusAgent - Version optimisée pour évaluation avec OpenRouter (Mixtral / Claude).
-
-Fonctionnalités :
-- Charge les PDFs (FAQ) depuis data/pdfs et les Excels depuis data/xlsx
-- Indexe les PDFs avec Chroma si disponible, sinon garde le texte en mémoire
-- Fournit des outils "SQL-like" sur les fichiers Excel via pandas
-- Orchestration entre RAG (FAQ) et données clients (Excel)
-- Extraction d'email / téléphone (et extensible au nom) depuis la question
-- Appelle OpenRouter (modèle configurable) comme générateur final
-- Expose `answer(question)` compatible avec evaluate.py
-
-Dépendances :
-pip install python-dotenv requests pandas PyPDF2
-Optionnel (pour Chroma/embeddings) :
-pip install chromadb langchain langchain-community langchain-text-splitters tf-keras
-"""
 
 import os
 import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from dotenv import load_dotenv
 import requests
-
-# --------------------------------------------------------------------------- #
-# Configuration globale
-# --------------------------------------------------------------------------- #
-
+from langsmith import get_current_run_tree
+# Configuration
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-# Tu peux changer le modèle ici ou via TELECOMPLUS_LLM_MODEL dans ton .env
-LLM_MODEL = os.getenv("TELECOMPLUS_LLM_MODEL", "anthropic/claude-3.7-sonnet")
+LLM_MODEL = os.getenv("TELECOMPLUS_LLM_MODEL", "openai/gpt-oss-120b")
 
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+# Import LangSmith APRÈS load_dotenv()
+try:
+    from langsmith import traceable
+    # Vérifier que les variables sont bien définies
+    if os.getenv("LANGSMITH_API_KEY") and os.getenv("LANGSMITH_TRACING") == "true":
+        LANGSMITH_AVAILABLE = True
+        logging.info("LangSmith activé avec succès")
+    else:
+        LANGSMITH_AVAILABLE = False
+        logging.warning("LangSmith désactivé : variables d'environnement manquantes")
+except ImportError:
+    LANGSMITH_AVAILABLE = False
+    logging.warning("LangSmith non disponible. Installez-le avec: pip install langsmith")
+    
+    # Créer un décorateur dummy si LangSmith n'est pas disponible
+    def traceable(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 PDF_DIR = os.path.join(DATA_DIR, "pdfs")
 XLSX_DIR = os.path.join(DATA_DIR, "xlsx")
@@ -44,17 +41,16 @@ XLSX_DIR = os.path.join(DATA_DIR, "xlsx")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("TelecomPlusAgent")
 
-# Regex simples pour email et téléphone
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"\+?\d[\d\s().-]{6,}")
+NAME_PATTERN = re.compile(r"(?:je m'appelle|je suis|mon nom est|c'est)\s+([A-ZÀ-ÖØ-Ý][a-zà-öø-ÿ]+(?:\s+[A-ZÀ-ÖØ-Ý][a-zà-öø-ÿ]+))", re.IGNORECASE)
 
-# --------------------------------------------------------------------------- #
-# Dépendances optionnelles (RAG / vecteurs / LLM)
-# --------------------------------------------------------------------------- #
+# Imports optionnels
 try:
     from langchain_community.document_loaders import PyPDFLoader
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     from langchain_community.vectorstores import Chroma
+    import chromadb
     from langchain_community.embeddings import HuggingFaceEmbeddings
     logger.info("Imports LangChain / Chroma OK.")
 except Exception as e:
@@ -70,10 +66,6 @@ except Exception:
     pd = None
 
 
-# --------------------------------------------------------------------------- #
-# Structures de données
-# --------------------------------------------------------------------------- #
-
 @dataclass
 class RetrievalResult:
     question: str
@@ -82,34 +74,19 @@ class RetrievalResult:
 
 
 class TelecomPlusAgent:
-    """
-    Agent principal :
-    - RAG sur les FAQ PDF
-    - Outils tabulaires (Excel) pour les données clients
-    - Génération finale via OpenRouter
-    """
-
     def __init__(self):
-        # PDF / RAG
         self.vectorstore = None
         self.pdf_chunks: List[str] = []
-
-        # Données tabulaires
         self.dataframes: Dict[str, "pd.DataFrame"] = {}
-
-        # Initialisation des données
         self._init_data()
 
-    # ------------------------------------------------------------------ #
-    # Initialisation des données
-    # ------------------------------------------------------------------ #
     def _init_data(self) -> None:
         self._load_excels()
         self._build_or_load_pdf_index()
 
     def _load_excels(self) -> None:
         if pd is None:
-            logger.warning("pandas non disponible : les outils tabulaires sont désactivés.")
+            logger.warning("pandas non disponible")
             return
 
         filenames = [
@@ -128,8 +105,6 @@ class TelecomPlusAgent:
                     logger.info("Chargé: %s", path)
                 except Exception as e:
                     logger.error("Erreur de chargement %s: %s", path, e)
-            else:
-                logger.warning("Fichier Excel introuvable: %s", path)
 
     def _build_or_load_pdf_index(self) -> None:
         pdf_files = [
@@ -141,7 +116,6 @@ class TelecomPlusAgent:
             logger.warning("Aucun PDF trouvé dans %s", PDF_DIR)
             return
 
-        # Si Chroma + embeddings disponibles, on construit un index
         if PyPDFLoader and RecursiveCharacterTextSplitter and Chroma and HuggingFaceEmbeddings:
             logger.info("Construction de l'index Chroma pour les FAQ...")
             docs = []
@@ -163,22 +137,18 @@ class TelecomPlusAgent:
             )
             logger.info("Index Chroma construit (%d chunks).", len(split_docs))
         else:
-            # Fallback : garder seulement le texte en mémoire
             logger.warning("Chroma/Embeddings indisponibles, fallback en mémoire.")
             texts = []
-            if not PyPDFLoader:
-                logger.warning("PyPDFLoader indisponible, impossible de charger les PDF.")
-            else:
+            if PyPDFLoader:
                 for pdf in pdf_files:
                     loader = PyPDFLoader(os.path.join(PDF_DIR, pdf))
                     docs = loader.load()
                     texts.extend([d.page_content for d in docs])
             self.pdf_chunks = texts
 
-    # ------------------------------------------------------------------ #
-    # RAG PDF
-    # ------------------------------------------------------------------ #
+    @traceable(name="retrieve_from_pdfs", run_type="retriever")
     def retrieve_from_pdfs(self, question: str, k: int = 6) -> RetrievalResult:
+        """RAG avec monitoring LangSmith"""
         if self.vectorstore:
             docs = self.vectorstore.similarity_search(question, k=k)
             chunks = [d.page_content for d in docs]
@@ -186,34 +156,80 @@ class TelecomPlusAgent:
             chunks = self.pdf_chunks[:k] if self.pdf_chunks else []
 
         context = "\n\n---\n\n".join(chunks)
-        return RetrievalResult(
+        result = RetrievalResult(
             question=question,
             context=context,
             source_chunks=chunks,
         )
+        
+        return result
 
-    # ------------------------------------------------------------------ #
-    # Outils "SQL-like" sur les Excels (simplifiés)
-    # ------------------------------------------------------------------ #
-    def get_client_by_email_or_phone(self, identifier: str) -> Optional[Dict[str, Any]]:
-        if not identifier:
-            return None
-        if pd is None or "clients" not in self.dataframes:
+    @traceable(name="get_client_data", run_type="tool")
+    def get_client_by_identifier(self, identifier: str, identifier_type: str = "auto") -> Optional[Dict[str, Any]]:
+
+        if not identifier or pd is None or "clients" not in self.dataframes:
+            logger.warning("Impossible de rechercher le client : données manquantes")
             return None
 
         df = self.dataframes["clients"]
-        mask = (
-            df["email"].astype(str).str.contains(identifier, case=False, na=False)
-            | df["telephone"].astype(str).str.contains(identifier, case=False, na=False)
-        )
+        logger.info(f"Recherche client avec '{identifier}' (type: {identifier_type})")
+        logger.info(f"Colonnes disponibles : {list(df.columns)}")
+        
+        if identifier_type == "name":
+            # Normaliser le nom pour la recherche (minuscules, sans accents extrêmes)
+            identifier_lower = identifier.lower()
+            parts = identifier_lower.split()
+            
+            # Recherche flexible : nom OU prénom OU nom complet
+            mask = pd.Series([False] * len(df))
+            
+            # Vérifier chaque partie du nom
+            for part in parts:
+                mask = mask | df["nom"].astype(str).str.lower().str.contains(part, na=False)
+                mask = mask | df["prenom"].astype(str).str.lower().str.contains(part, na=False)
+            
+            # Vérifier aussi le nom complet
+            full_name_col = (df["prenom"].astype(str) + " " + df["nom"].astype(str)).str.lower()
+            mask = mask | full_name_col.str.contains(identifier_lower, na=False)
+            
+            #print(f"Résultats pour recherche par nom : {mask.sum()} client(s)")
+            
+        elif identifier_type == "email":
+            mask = df["email"].astype(str).str.lower().str.contains(identifier.lower(), case=False, na=False)
+            logger.info(f"Résultats pour recherche par email : {mask.sum()} client(s)")
+            
+        elif identifier_type == "phone":
+            # Nettoyer le téléphone pour la comparaison
+            clean_phone = re.sub(r'[^\d+]', '', identifier)
+            mask = df["telephone"].astype(str).str.replace(r'[^\d+]', '', regex=True).str.contains(clean_phone, na=False)
+            logger.info(f"Résultats pour recherche par téléphone : {mask.sum()} client(s)")
+            
+        else:  # auto
+            identifier_lower = identifier.lower()
+            mask = (
+                df["email"].astype(str).str.lower().str.contains(identifier_lower, na=False) |
+                df["telephone"].astype(str).str.contains(identifier, na=False) |
+                df["nom"].astype(str).str.lower().str.contains(identifier_lower, na=False) |
+                df["prenom"].astype(str).str.lower().str.contains(identifier_lower, na=False)
+            )
+            #print(f"Résultats pour recherche auto : {mask.sum()} client(s)")
+        
         rows = df[mask]
+        
         if rows.empty:
+            #print(f"Aucun client trouvé pour '{identifier}'")
+            if identifier_type == "name":
+                all_names = [f"{row['prenom']} {row['nom']}" for _, row in df.iterrows()]
+                #print(f"Noms disponibles dans la base : {all_names[:5]}...")
             return None
-        return rows.iloc[0].to_dict()
-
+        
+        result = rows.iloc[0].to_dict()
+        #print(f"✅ Client trouvé : {result.get('prenom')} {result.get('nom')} (ID: {result.get('client_id')})")
+        return result
+    
     def get_client_invoices_summary(self, client_id: Any) -> str:
         if pd is None or "factures" not in self.dataframes:
-            return "Les informations de facturation ne sont pas disponibles pour le moment."
+            return "Les informations de facturation ne sont pas disponibles."
 
         df = self.dataframes["factures"]
         rows = df[df["client_id"] == client_id]
@@ -225,67 +241,146 @@ class TelecomPlusAgent:
             f"statut {latest.get('statut_paiement')}, "
             f"échéance le {latest.get('date_echeance')}."
         )
+    def get_client_subscription_info(self, client_id: Any) -> str:
+        """Récupère les informations d'abonnement du client"""
+        if pd is None or "abonnements" not in self.dataframes:
+            return ""
+        
+        df = self.dataframes["abonnements"]
+        rows = df[df["client_id"] == client_id]
+        if rows.empty:
+            return ""
+        
+        sub = rows.iloc[0]
+        forfait_id = sub.get("forfait_id")
+        
+        # Récupérer les détails du forfait
+        forfait_info = ""
+        if "forfaits" in self.dataframes:
+            forfait_df = self.dataframes["forfaits"]
+            forfait_rows = forfait_df[forfait_df["forfait_id"] == forfait_id]
+            if not forfait_rows.empty:
+                forfait = forfait_rows.iloc[0]
+                forfait_info = (
+                    f"Forfait actuel : {forfait.get('nom_forfait', 'N/A')}\n"
+                    f"Prix : {forfait.get('prix_mensuel', 'N/A')} €/mois\n"
+                    f"Data : {forfait.get('data_mensuel_gb', 'N/A')} Go\n"
+                    f"Appels : {forfait.get('minutes_incluses', 'N/A')}\n"
+                    f"SMS : {forfait.get('sms_inclus', 'N/A')}\n"
+                )
+        
+        return (
+            f"{forfait_info}"
+            f"Date de début : {sub.get('date_debut', 'N/A')}\n"
+            f"Date de fin d'engagement : {sub.get('date_fin', 'N/A')}\n"
+            f"Statut : {sub.get('statut', 'N/A')}"
+        )
 
-    # ------------------------------------------------------------------ #
-    # Routing / classification de la question
-    # ------------------------------------------------------------------ #
+    def get_client_consumption(self, client_id: Any) -> str:
+        """Récupère la consommation du client"""
+        if pd is None or "consommation" not in self.dataframes:
+            return ""
+        
+        df = self.dataframes["consommation"]
+        rows = df[df["client_id"] == client_id]
+        if rows.empty:
+            return ""
+        
+        latest = rows.sort_values("mois", ascending=False).iloc[0]
+        return (
+            f"Consommation du mois de {latest.get('mois', 'N/A')} :\n"
+            f"- Data utilisée : {latest.get('data_utilise_gb', 0)} Go\n"
+            f"- Appels : {latest.get('minutes_utilisees', 0)} minutes\n"
+            f"- SMS envoyés : {latest.get('sms_utilises', 0)}"
+        )
+    def get_client_tickets(self, client_id: Any) -> str:
+        """Récupère les tickets de support du client"""
+        if pd is None or "tickets_support" not in self.dataframes:
+            return ""
+        
+        df = self.dataframes["tickets_support"]
+        rows = df[df["client_id"] == client_id]
+        if rows.empty:
+            return "Aucun ticket de support en cours."
+        
+        # Filtrer les tickets en cours (statut != 'Résolu')
+        open_tickets = rows[rows["statut"] != "Résolu"]
+        
+        if open_tickets.empty:
+            return "Aucun ticket de support en cours. Tous vos tickets ont été résolus."
+        
+        ticket_parts = []
+        for idx, ticket in open_tickets.iterrows():
+            ticket_parts.append(
+                f"Ticket #{ticket.get('ticket_id')} : '{ticket.get('sujet')}' "
+                f"(Catégorie : {ticket.get('categorie')}, Statut : {ticket.get('statut')})"
+            )
+        
+        return f"Vous avez {len(open_tickets)} ticket(s) en cours :\n" + "\n".join(ticket_parts)
+
+
     def _needs_client_data(self, question: str) -> bool:
         q = question.lower()
         keywords = [
-            "ma facture",
-            "mes factures",
-            "mon forfait",
-            "mon abonnement",
-            "mes consommations",
-            "mon engagement",
-            "mon contrat",
-            "mon compte",
+            "ma facture", "mes factures", "mon forfait", "mon abonnement",
+            "mes consommations", "mon engagement", "mon contrat", "mon compte",
         ]
         return any(k in q for k in keywords)
 
+    @traceable(name="classify_query", run_type="tool")
     def _classify_query(self, question: str) -> str:
+        """Classification de la question"""
         q = question.lower()
 
         if self._needs_client_data(question):
-            return "client"
+            query_type = "client"
+        else:
+            billing_keywords = ["facture", "paiement", "échéance", "prélèvement"]
+            tech_keywords = ["réseau", "4g", "5g", "internet", "débit", "panne", "coupure"]
+            offer_keywords = ["forfait", "offre", "option", "tarif", "engagement", "roaming"]
 
-        billing_keywords = ["facture", "paiement", "échéance", "prélèvement"]
-        tech_keywords = ["réseau", "4g", "5g", "internet", "débit", "panne", "coupure"]
-        offer_keywords = ["forfait", "offre", "option", "tarif", "engagement", "roaming", "international"]
+            if any(k in q for k in billing_keywords):
+                query_type = "billing"
+            elif any(k in q for k in tech_keywords):
+                query_type = "technical"
+            elif any(k in q for k in offer_keywords):
+                query_type = "offer"
+            else:
+                query_type = "generic"
+        
+        return query_type
 
-        if any(k in q for k in billing_keywords):
-            return "billing"
-        if any(k in q for k in tech_keywords):
-            return "technical"
-        if any(k in q for k in offer_keywords):
-            return "offer"
-
-        return "generic"
-
-    # ------------------------------------------------------------------ #
-    # Extraction d'identifiant client (email / téléphone)
-    # ------------------------------------------------------------------ #
-    def _extract_identifier(self, question: str) -> str:
-        # Email en priorité
+    def _extract_identifier(self, question: str) -> Tuple[str, str]:
+        """
+        Extrait l'identifiant client et son type
+        Returns: (identifier, type) où type in ['email', 'phone', 'name', '']
+        """
+        # 1. Chercher un nom (priorité haute pour les questions personnelles)
+        name_match = NAME_PATTERN.search(question)
+        if name_match:
+            full_name = name_match.group(1).strip()
+            logger.info(f"Nom extrait: {full_name}")
+            return (full_name, "name")
+        
+        # 2. Chercher un email
         email_match = EMAIL_REGEX.search(question)
         if email_match:
-            return email_match.group(0)
+            return (email_match.group(0), "email")
 
-        # Téléphone simple
+        # 3. Chercher un téléphone
         phone_match = PHONE_REGEX.search(question)
         if phone_match:
             phone = re.sub(r"[^\d+]", "", phone_match.group(0))
-            return phone
+            return (phone, "phone")
 
-        return ""
+        return ("", "")
 
-    # ------------------------------------------------------------------ #
-    # Appel OpenRouter
-    # ------------------------------------------------------------------ #
+    @traceable(name="call_llm", run_type="llm")
     def _call_openrouter(self, system_prompt: str, user_prompt: str) -> str:
+        """Appel LLM avec monitoring complet"""
         if not OPENROUTER_API_KEY:
-            logger.warning("OPENROUTER_API_KEY manquant, réponse de fallback.")
-            return "Le service IA externe n'est pas configuré. Merci de réessayer plus tard."
+            logger.warning("OPENROUTER_API_KEY manquant")
+            return "Le service IA externe n'est pas configuré."
 
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
@@ -305,93 +400,199 @@ class TelecomPlusAgent:
             resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            answer = data["choices"][0]["message"]["content"]
+            
+            # Ajouter les métadonnées pour LangSmith
+            if LANGSMITH_AVAILABLE:
+                try:
+                    run_tree = get_current_run_tree()
+                    if run_tree:
+                        usage = data.get("usage", {})
+                        run_tree.extra = {
+                            "model": LLM_MODEL,
+                            "input_tokens": usage.get("prompt_tokens", 0),
+                            "output_tokens": usage.get("completion_tokens", 0),
+                            "total_tokens": usage.get("total_tokens", 0),
+                        }
+                except Exception as e:
+                    logger.debug(f"Impossible d'ajouter les métadonnées LangSmith: {e}")
+            
+            return answer
         except Exception as e:
             logger.error("Erreur appel OpenRouter: %s", e)
-            return "Une erreur technique s'est produite lors de la génération de la réponse."
+            return "Une erreur technique s'est produite."
 
-    # ------------------------------------------------------------------ #
-    # Orchestration principale
-    # ------------------------------------------------------------------ #
+    @traceable(
+        name="answer_customer_query",
+        run_type="chain",
+        project_name="telecomplus-agent"
+    )
     def answer(self, question: str) -> str:
-        """
-        Point d'entrée principal, utilisé par evaluate.py et app.py.
-        """
+        """Point d'entrée principal avec monitoring complet"""
         query_type = self._classify_query(question)
         needs_data = (query_type == "client")
 
-        # 1) RAG PDF
+        # RAG
         retrieval = self.retrieve_from_pdfs(question, k=6)
 
-        # 2) Données client (si pertinent)
+        # Données client
         data_context = ""
-        if needs_data:
-            identifier = self._extract_identifier(question)
-            client = self.get_client_by_email_or_phone(identifier) if identifier else None
+        client_found = False
+
+        if needs_data or "je m'appelle" in question.lower() or "je suis" in question.lower():
+            identifier, id_type = self._extract_identifier(question)
+            logger.info(f"Identifiant extrait: '{identifier}' (type: {id_type})")
+            
+            client = self.get_client_by_identifier(identifier, id_type) if identifier else None
 
             if client:
-                client_id = client.get("id")
+                client_found = True
+                client_id = client.get("client_id")
+                
+                # Collecter toutes les informations pertinentes
+                context_parts = ["=== INFORMATIONS CLIENT DISPONIBLES ==="]
+                context_parts.append(f"Nom : {client.get('nom', 'N/A')} {client.get('prenom', 'N/A')}")
+                context_parts.append(f"Email : {client.get('email', 'N/A')}")
+                context_parts.append(f"Téléphone : {client.get('telephone', 'N/A')}")
+                context_parts.append(f"Statut du compte : {client.get('statut', 'N/A')}")
+                
+                # Abonnement
+                sub_info = self.get_client_subscription_info(client_id)
+                if sub_info:
+                    context_parts.append("\n=== ABONNEMENT ET FORFAIT ===")
+                    context_parts.append(sub_info)
+                
+                # Consommation
+                consumption = self.get_client_consumption(client_id)
+                if consumption:
+                    context_parts.append("\n=== CONSOMMATION ACTUELLE ===")
+                    context_parts.append(consumption)
+                
+                # Factures
                 factures_summary = self.get_client_invoices_summary(client_id)
-                data_context = (
-                    "Informations client:\n"
-                    + json.dumps(client, default=str, ensure_ascii=False)
-                    + "\n\nRésumé factures:\n"
-                    + factures_summary
-                )
+                context_parts.append("\n=== FACTURES RÉCENTES ===")
+                context_parts.append(factures_summary)
+                
+                # Tickets
+                tickets = self.get_client_tickets(client_id)
+                if tickets:
+                    context_parts.append("\n=== TICKETS DE SUPPORT ===")
+                    context_parts.append(tickets)
+                
+                data_context = "\n".join(context_parts)
             else:
-                data_context = (
-                    "Aucune information client spécifique n'a pu être trouvée "
-                    "(identifiant client non présent ou non reconnu dans la question)."
-                )
+                if identifier:
+                    data_context = (
+                        f"⚠️ AUCUNE DONNÉE CLIENT TROUVÉE pour l'identifiant '{identifier}' (type: {id_type}). "
+                        "Cela peut signifier que le client n'existe pas dans la base ou que l'identifiant est incorrect."
+                    )
 
-        # 3) Prompt système
-        system_prompt = (
-            "Tu es un agent de support client expert pour un opérateur téléphonique fictif nommé TelecomPlus. "
-            "Tu réponds en français, avec un ton professionnel, empathique et rassurant. "
-            "Tu aides les clients sur des sujets comme : factures, forfaits, options, consommation, "
-            "problèmes de réseau, roaming et support technique. "
-            "Base-toi uniquement sur le contexte fourni (FAQ PDF et données tabulaires Excel). "
-            "Ne fais pas de suppositions sur des données clients si elles ne sont pas explicitement présentes. "
-            "Quand une information manque, indique-le clairement et propose des étapes concrètes "
-            '(par exemple : \"connectez-vous à votre espace client\" ou \"contactez le service client au numéro indiqué sur votre facture\"). '
-            "Tes réponses doivent être factuelles, structurées et centrées sur la résolution du problème du client."
+        # Prompts
+        system_prompt = ("""Tu es un conseiller clientèle expert de TelecomPlus, opérateur de télécommunications français. 
+RÈGLE D'OR ABSOLUE :
+Si des DONNÉES CLIENT sont fournies dans le contexte, tu DOIS les utiliser pour répondre de manière PERSONNALISÉE et PRÉCISE.
+Tu NE DOIS JAMAIS dire "je ne peux pas accéder" ou "consultez votre espace client" si les données sont dans le contexte.
+
+PRINCIPES FONDAMENTAUX :
+1. DONNÉES AVANT TOUT : Si le contexte contient des données client (factures, consommation, forfait), utilise-les DIRECTEMENT dans ta réponse
+2. PRÉCISION MAXIMALE : Cite les montants exacts, dates précises, et chiffres spécifiques issus du contexte
+3. PERSONNALISATION OBLIGATOIRE : Adresse-toi au client par son nom si disponible
+4. ZÉRO HALLUCINATION : N'invente JAMAIS de données. Si absent du contexte, dis-le clairement
+5. RÉPONSE DIRECTE : Va droit au but avec l'information demandée
+
+INTERDICTIONS ABSOLUES :
+Ne JAMAIS dire "consultez votre espace client" si les données sont dans le contexte
+ Ne JAMAIS dire "je ne peux pas accéder à vos données" si elles sont fournies
+ Ne JAMAIS inventer des montants, dates ou informations
+ Ne JAMAIS être vague si des données précises sont disponibles
+ Ne JAMAIS ignorer les données client fournies
+
+FORMAT DE RÉPONSE QUAND DONNÉES CLIENT DISPONIBLES :
+1. Salue le client par son nom
+2. RÉPONDS DIRECTEMENT avec les chiffres/dates exacts du contexte
+3. Explique brièvement si nécessaire
+4. Propose une action concrète si pertinent
+
+FORMAT QUAND DONNÉES MANQUANTES :
+1. Indique clairement quelle information manque
+2. Explique comment le client peut l'obtenir
+3. Propose des alternatives basées sur la FAQ
+
+STYLE :
+- Professionnel mais chaleureux
+- Paragraphes courts (2-3 phrases max)
+- Pas de listes à puces sauf si vraiment nécessaire
+- Empathique et orienté solution """
         )
 
-        # 4) Prompt utilisateur structuré
         user_prompt_parts = [
-            "Tu vas répondre à un client de TelecomPlus.",
-            f"Question du client :\n{question}",
-            f"Type de question détecté : {query_type}",
-            "\n===== CONTEXTE FAQ (PDF) =====\n",
-            retrieval.context or "(aucun contexte FAQ disponible).",
+            "=== QUESTION DU CLIENT ===",
+            question,
+            "",
+            f"=== TYPE DE DEMANDE : {query_type.upper()} ===",
+            ""
         ]
 
         if data_context:
-            user_prompt_parts.append("\n===== CONTEXTE DONNÉES CLIENT (Excel) =====\n")
-            user_prompt_parts.append(data_context)
+            user_prompt_parts.extend([
+                data_context,
+                ""
+            ])
+            
+            if client_found:
+                user_prompt_parts.extend([
+                    "INSTRUCTION CRITIQUE :",
+                    "Les données ci-dessus contiennent TOUTES les informations nécessaires pour répondre.",
+                    "Tu DOIS utiliser ces données exactes dans ta réponse.",
+                    "N'invite PAS le client à consulter son espace - RÉPONDS DIRECTEMENT avec ces données.",
+                    ""
+                ])
 
-        user_prompt_parts.append(
-            "\n===== CONSIGNES DE RÉPONSE =====\n"
-            "- Commence par une phrase courte qui répond directement à la question du client.\n"
-            "- Ensuite, détaille les informations importantes (montants, dates, conditions, démarches) en quelques phrases ou points.\n"
-            "- Si des informations clients sont disponibles, personnalise la réponse (par exemple : montant, échéance, statut de facture).\n"
-            "- Si des informations sont manquantes, explique-le poliment et propose des démarches concrètes.\n"
-            "- Si la question concerne un forfait ou une offre, explique clairement les conditions importantes (prix, durée d'engagement, options, limitations) présentes dans le contexte.\n"
-            "- Ne mentionne pas ce contexte interne, ni les noms de fichiers, ni les mots 'FAQ', 'Excel' ou 'PDF'.\n"
-            "- Ne génère pas d'informations qui ne figurent pas dans le contexte.\n"
-            "- Formule une seule réponse finale en français, adaptée au client."
-        )
+        if retrieval.context:
+            user_prompt_parts.extend([
+                "=== BASE DE CONNAISSANCES (FAQ) ===",
+                retrieval.context,
+                ""
+            ])
+        response_instructions = {
+            "client": """
+            INSTRUCTIONS DE RÉPONSE :
+            1. Utilise le NOM du client pour le saluer
+            2. CITE LES CHIFFRES EXACTS des données (montant, date, Go utilisés, etc.)
+            3. Réponds de manière DIRECTE - pas de détours
+            4. Si la donnée est dans le contexte, ne suggère PAS de consulter l'espace client
+            5. Termine par une question ou proposition d'aide si pertinent
+            """,
+            "billing": "Explique clairement avec les tarifs et dates du contexte FAQ. Sois précis sur les modalités.",
+            "technical": "Fournis des étapes de dépannage concrètes et numérotées. Rassure le client.",
+            "offer": "Compare les forfaits avec le forfait actuel du client si disponible. Indique prix et conditions.",
+            "generic": "Réponds avec les informations de la FAQ. Reste professionnel et utile."
+        }
 
+        user_prompt_parts.extend([
+            response_instructions.get(query_type, response_instructions["generic"]),
+            "",
+            "RÉPONDS MAINTENANT de manière DIRECTE et PERSONNALISÉE :"
+        ])
         user_prompt = "\n".join(user_prompt_parts)
-
-        # 5) Appel au modèle
         answer = self._call_openrouter(system_prompt, user_prompt)
+        
+        # Ajouter métadonnées pour LangSmith
+        if LANGSMITH_AVAILABLE:
+            try:
+                run_tree = get_current_run_tree()
+                if run_tree:
+                    run_tree.extra = {
+                        "query_type": query_type,
+                        "rag_chunks_used": len(retrieval.source_chunks),
+                        "client_data_used": bool(data_context),
+                        "question_length": len(question),
+                    }
+            except Exception as e:
+                logger.debug(f"Impossible d'ajouter les métadonnées: {e}")
+        
         return answer.strip()
 
-
-# --------------------------------------------------------------------------- #
-# Instance globale + wrapper pour evaluate.py
-# --------------------------------------------------------------------------- #
 
 _agent: Optional[TelecomPlusAgent] = None
 
@@ -404,9 +605,4 @@ def get_agent() -> TelecomPlusAgent:
 
 
 def answer(question: str) -> str:
-    """
-    Wrapper simple à utiliser dans evaluate.py :
-    from src.main import answer
-    resp = answer("Ma question")
-    """
     return get_agent().answer(question)
