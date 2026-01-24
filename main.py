@@ -1,12 +1,11 @@
-
 import os
 import json
 import logging
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
-
 from dotenv import load_dotenv
+from httpcore import stream
 import requests
 from langsmith import get_current_run_tree
 # Configuration
@@ -376,10 +375,13 @@ class TelecomPlusAgent:
         return ("", "")
 
     @traceable(name="call_llm", run_type="llm")
-    def _call_openrouter(self, system_prompt: str, user_prompt: str) -> str:
-        """Appel LLM avec monitoring complet"""
+    def _call_openrouter(self, system_prompt: str, user_prompt: str, stream: bool = False):
+        """Appel LLM avec support streaming"""
         if not OPENROUTER_API_KEY:
             logger.warning("OPENROUTER_API_KEY manquant")
+            if stream:
+                yield "Le service IA externe n'est pas configuré."
+                return
             return "Le service IA externe n'est pas configuré."
 
         url = "https://openrouter.ai/api/v1/chat/completions"
@@ -394,40 +396,61 @@ class TelecomPlusAgent:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.3,
+            "stream": stream,
         }
 
         try:
-            resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
+            resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=60, stream=stream)
             resp.raise_for_status()
-            data = resp.json()
-            answer = data["choices"][0]["message"]["content"]
             
-            # Ajouter les métadonnées pour LangSmith
-            if LANGSMITH_AVAILABLE:
-                try:
-                    run_tree = get_current_run_tree()
-                    if run_tree:
-                        usage = data.get("usage", {})
-                        run_tree.extra = {
-                            "model": LLM_MODEL,
-                            "input_tokens": usage.get("prompt_tokens", 0),
-                            "output_tokens": usage.get("completion_tokens", 0),
-                            "total_tokens": usage.get("total_tokens", 0),
-                        }
-                except Exception as e:
-                    logger.debug(f"Impossible d'ajouter les métadonnées LangSmith: {e}")
-            
-            return answer
+            if stream:
+                for line in resp.iter_lines():
+                    if line:
+                        line = line.decode('utf-8')
+                        if line.startswith('data: '):
+                            data_str = line[6:]
+                            if data_str == '[DONE]':
+                                break
+                            try:
+                                data = json.loads(data_str)
+                                if 'choices' in data and len(data['choices']) > 0:
+                                    delta = data['choices'][0].get('delta', {})
+                                    content = delta.get('content', '')
+                                    if content:
+                                        yield content
+                            except json.JSONDecodeError:
+                                continue
+            else:
+                data = resp.json()
+                answer = data["choices"][0]["message"]["content"]
+                
+                if LANGSMITH_AVAILABLE:
+                    try:
+                        run_tree = get_current_run_tree()
+                        if run_tree:
+                            usage = data.get("usage", {})
+                            run_tree.extra = {
+                                "model": LLM_MODEL,
+                                "input_tokens": usage.get("prompt_tokens", 0),
+                                "output_tokens": usage.get("completion_tokens", 0),
+                                "total_tokens": usage.get("total_tokens", 0),
+                            }
+                    except Exception as e:
+                        logger.debug(f"Impossible d'ajouter les métadonnées LangSmith: {e}")
+                
+                return answer
         except Exception as e:
             logger.error("Erreur appel OpenRouter: %s", e)
-            return "Une erreur technique s'est produite."
-
+            if stream:
+                yield "Une erreur technique s'est produite."
+            else:
+                return "Une erreur technique s'est produite."
     @traceable(
         name="answer_customer_query",
         run_type="chain",
         project_name="telecomplus-agent"
     )
-    def answer(self, question: str) -> str:
+    def answer(self, question: str, stream: bool = False):
         """Point d'entrée principal avec monitoring complet"""
         query_type = self._classify_query(question)
         needs_data = (query_type == "client")
@@ -498,7 +521,11 @@ PRINCIPES FONDAMENTAUX :
 2. PRÉCISION MAXIMALE : Cite les montants exacts, dates précises, et chiffres spécifiques issus du contexte
 3. PERSONNALISATION OBLIGATOIRE : Adresse-toi au client par son nom si disponible
 4. ZÉRO HALLUCINATION : N'invente JAMAIS de données. Si absent du contexte, dis-le clairement
-5. RÉPONSE DIRECTE : Va droit au but avec l'information demandée
+        "5. Pour les questions sur les iPhones (prix, coloris, spécifications techniques):\n"
+        "   - Si l'information est dans le contexte: utilise-la\n"
+        "   - Si l'information N'EST PAS dans le contexte: utilise tes connaissances générales sur les produits Apple et le marché télécom\n"
+        "   - Fournis des réponses précises basées sur les standards du marché\n"
+6. RÉPONSE DIRECTE : Va droit au but avec l'information demandée
 
 INTERDICTIONS ABSOLUES :
 Ne JAMAIS dire "consultez votre espace client" si les données sont dans le contexte
@@ -558,10 +585,14 @@ STYLE :
             "client": """
             INSTRUCTIONS DE RÉPONSE :
             1. Utilise le NOM du client pour le saluer
-            2. CITE LES CHIFFRES EXACTS des données (montant, date, Go utilisés, etc.)
+            2. CITE LES CHIFFRES EXACTS des données (montant, date, Gb utilisés, etc.)
             3. Réponds de manière DIRECTE - pas de détours
             4. Si la donnée est dans le contexte, ne suggère PAS de consulter l'espace client
             5. Termine par une question ou proposition d'aide si pertinent
+            - Pour les produits/iPhones: utilise le contexte OU tes connaissances si le contexte est insuffisant
+            - Pour les données clients: utilise UNIQUEMENT les données fournies
+
+
             """,
             "billing": "Explique clairement avec les tarifs et dates du contexte FAQ. Sois précis sur les modalités.",
             "technical": "Fournis des étapes de dépannage concrètes et numérotées. Rassure le client.",
@@ -577,21 +608,26 @@ STYLE :
         user_prompt = "\n".join(user_prompt_parts)
         answer = self._call_openrouter(system_prompt, user_prompt)
         
-        # Ajouter métadonnées pour LangSmith
-        if LANGSMITH_AVAILABLE:
-            try:
-                run_tree = get_current_run_tree()
-                if run_tree:
-                    run_tree.extra = {
-                        "query_type": query_type,
-                        "rag_chunks_used": len(retrieval.source_chunks),
-                        "client_data_used": bool(data_context),
-                        "question_length": len(question),
-                    }
-            except Exception as e:
-                logger.debug(f"Impossible d'ajouter les métadonnées: {e}")
-        
-        return answer.strip()
+        if stream:
+                for chunk in self._call_openrouter(system_prompt, user_prompt, stream=True):
+                    yield chunk
+        else:
+                answer = self._call_openrouter(system_prompt, user_prompt, stream=False)
+                
+                if LANGSMITH_AVAILABLE:
+                    try:
+                        run_tree = get_current_run_tree()
+                        if run_tree:
+                            run_tree.extra = {
+                                "query_type": query_type,
+                                "rag_chunks_used": len(retrieval.source_chunks),
+                                "client_data_used": bool(data_context),
+                                "question_length": len(question),
+                            }
+                    except Exception as e:
+                        logger.debug(f"Impossible d'ajouter les métadonnées: {e}")
+                
+                return answer.strip()
 
 
 _agent: Optional[TelecomPlusAgent] = None
@@ -604,5 +640,9 @@ def get_agent() -> TelecomPlusAgent:
     return _agent
 
 
-def answer(question: str) -> str:
-    return get_agent().answer(question)
+def answer(question: str, stream: bool = False):
+    agent = get_agent()
+    if stream:
+        return agent.answer(question, stream=True)
+    else:
+        return agent.answer(question, stream=False)

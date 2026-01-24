@@ -12,7 +12,7 @@ try:
 except Exception:  # tqdm is optional
     tqdm = None
 
-from main import answer as agent_answer
+from src.main import answer as agent_answer
 
 
 BASE_DIR = os.path.dirname(__file__)

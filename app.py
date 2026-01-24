@@ -27,11 +27,19 @@ if prompt := st.chat_input("Posez votre question..."):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Get assistant response
+    # Get assistant response with streaming
     with st.chat_message("assistant"):
-        response = answer(prompt)
-        st.markdown(response)
+        message_placeholder = st.empty()
+        full_response = ""
+        
+        # Stream the response
+        for chunk in answer(prompt, stream=True):
+            full_response += chunk
+            message_placeholder.markdown(full_response + "▌")
+        
+        # Display final response without cursor
+        message_placeholder.markdown(full_response)
 
     # Add assistant response to chat history
     st.session_state.messages.append(
-        {"role": "assistant", "content": response})
+        {"role": "assistant", "content": full_response})
