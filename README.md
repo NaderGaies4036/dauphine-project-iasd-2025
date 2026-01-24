@@ -32,6 +32,7 @@ Agent intelligent de support client pour opérateur télécom utilisant RAG (Ret
 - Scoring de 0 à 1 avec justifications
 - Export des résultats dans Excel
 
+Le score obtenu est de 0.8
 ### 🔍 Monitoring & Observabilité
 
 - Intégration Langfuse pour traçage complet
@@ -74,7 +75,7 @@ Agent intelligent de support client pour opérateur télécom utilisant RAG (Ret
              ▼
 ┌─────────────────────────────────────────────────────────┐
 │              Génération LLM (OpenRouter)                │
-│           • Claude 3.7 Sonnet (défaut)                  │
+│           • openai/gpt-oss-120b                 │
 │           • Prompt enrichi avec contexte                │
 └────────────────────┬────────────────────────────────────┘
                      │
@@ -102,7 +103,7 @@ telecomplus_query
 ### Backend & LLM
 - **LangChain** : Framework pour applications LLM
 - **OpenRouter** : API unifiée pour accès aux LLMs (Claude, GPT, Mixtral, etc.)
-- **Claude 3.7 Sonnet** : Modèle de génération par défaut
+- **openai/gpt-oss-120b** : Modèle de génération par défaut
 
 ### RAG & Embeddings
 - **ChromaDB** : Base de données vectorielle
@@ -197,7 +198,7 @@ dauphine-project-iasd-2025/
 | **Python** | Langage principal | 3.9+ |
 | **LangChain** | Framework LLM | 0.1.0 |
 | **OpenRouter** | API LLM unifiée | - |
-| **Claude 3.7 Sonnet** | Modèle de génération | Latest |
+| **openai/gpt-oss-120b** | Modèle de génération | Latest |
 
 ### RAG & Embeddings
 
